@@ -1,3 +1,4 @@
 autopatch.log*
 state.json
 *.bak
+termwrap/build/

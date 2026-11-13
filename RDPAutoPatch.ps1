@@ -17,6 +17,10 @@ La tarea programada se ejecuta al arrancar, cada 4 horas, cuando se cae TermServ
 usuario cierra o desconecta su sesion (para aplicar enseguida un cambio pospuesto).
 Los cambios de resultado se anotan en el registro de eventos Aplicacion, origen RDPAutoPatch:
   1000 OK | 1001 Pospuesto | 1002 Degradado (una sola sesion) | 1003 Error | 1004 Interferencia
+TermWrap.dll, al arrancar el servicio, anota en el mismo registro (origen TermWrap) que parches ha
+aplicado: 100 = parche de varias sesiones aplicado, 101 = no aplicado. Con 101 el modo TermWrap
+cuenta como fallido aunque el servicio funcione, porque solo habria una sesion.
+El codigo de TermWrap.dll y como compilarlo estan en la carpeta termwrap.
 
 Programa autocontenido: la carpeta de distribucion lleva este script, TermWrap.dll, Zydis.dll y
 los .bat. -Install lo copia todo a C:\Program Files\RDPAutoPatch (ruta protegida: el servicio
@@ -56,6 +60,7 @@ $script:ExitCode = 0
 $MaxFailures = 3       # fallos de un modo antes de descartarlo para esa version de termsrv.dll
 $RetryHours  = 24      # espera antes de reintentar un modo que ha fallado
 $EventSource = 'RDPAutoPatch'
+$TwSource    = 'TermWrap'   # origen con el que TermWrap.dll anota que parches ha aplicado
 $EventIds    = @{ OK = 1000, 'Information'; Pospuesto = 1001, 'Warning'; Degradado = 1002, 'Warning'; Error = 1003, 'Error'; Interferencia = 1004, 'Error' }
 
 $Modes = [ordered]@{
@@ -218,6 +223,23 @@ function Get-TsCrashes([datetime]$Since) {
         Where-Object { $_.Properties[0].Value -eq $display })
 }
 
+# Informe que deja TermWrap.dll al arrancar el servicio (evento 100/101), o $null si no hay
+function Get-TermWrapReport([int]$ProcessId) {
+    $start = try { (Get-Process -Id $ProcessId -ErrorAction Stop).StartTime.AddSeconds(-2) } catch { (Get-Date).AddMinutes(-10) }
+    # XPath en vez de ProviderName: funciona aunque el origen no este registrado en este equipo
+    $since = $start.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.000Z')
+    $q = "*[System[Provider[@Name='$TwSource'] and (EventID=100 or EventID=101) and TimeCreated[@SystemTime>='$since']]]"
+    try { Get-WinEvent -LogName Application -FilterXPath $q -MaxEvents 1 -ErrorAction Stop } catch { $null }
+}
+
+function Register-EventSources {
+    foreach ($src in $EventSource, $TwSource) {
+        try {
+            if (-not [Diagnostics.EventLog]::SourceExists($src)) { New-EventLog -LogName Application -Source $src; Write-Log "Origen de eventos '$src' registrado" }
+        } catch { Write-Log "No se pudo registrar el origen de eventos '$src': $_" WARN }
+    }
+}
+
 # Devuelve la lista de problemas (vacia = sano)
 function Get-HealthProblems([string]$Mode, [datetime]$Since, [int]$SettleSeconds) {
     $problems = New-Object System.Collections.Generic.List[string]
@@ -245,6 +267,19 @@ function Get-HealthProblems([string]$Mode, [datetime]$Since, [int]$SettleSeconds
         if ($Mode -eq 'TermWrap' -and $mods -notcontains 'Zydis.dll') { $problems.Add('Zydis.dll no esta cargado en el servicio') }
     } catch {
         Write-Log 'No se pueden listar los modulos del servicio; se omite esa comprobacion' WARN
+    }
+
+    # Que TermWrap este cargado no basta: hay que saber si ha encontrado donde parchear
+    if ($Mode -eq 'TermWrap') {
+        $ev = Get-TermWrapReport $pid2
+        if (-not $ev) {
+            Write-Log 'TermWrap no ha dejado informe de parches (DLL antigua o registro de eventos no disponible); se omite esa comprobacion' WARN
+        } else {
+            $detail = [string]$ev.Properties[0].Value
+            $notOk = ($detail -split ' ' | Where-Object { $_ -notmatch '=ok$' }) -join ' '
+            if ($ev.Id -eq 101) { $problems.Add("TermWrap no ha aplicado el parche de varias sesiones ($notOk)") }
+            elseif ($notOk) { Write-Log "TermWrap aplicado con avisos: $notOk" WARN }
+        }
     }
     , $problems
 }
@@ -407,9 +442,7 @@ function Invoke-Install {
             'el servicio se reinicia y esas conexiones se cortaran unos segundos. El cambio de modo final se pospone hasta que se cierren.') WARN
     }
     Backup-Params
-    try {
-        if (-not [Diagnostics.EventLog]::SourceExists($EventSource)) { New-EventLog -LogName Application -Source $EventSource; Write-Log "Origen de eventos '$EventSource' registrado" }
-    } catch { Write-Log "No se pudo registrar el origen de eventos: $_" WARN }
+    Register-EventSources
 
     # Copiar programa y DLL a la carpeta protegida (si cambian las DLL, soltarlas antes)
     if ($src -ine $AppDir) {
@@ -498,7 +531,9 @@ function Invoke-Uninstall {
     Set-ServiceDll $Modes.Original.Dll
     Restart-TermService
     Write-Log 'Servicio devuelto a termsrv.dll original de Windows' OK
-    try { if ([Diagnostics.EventLog]::SourceExists($EventSource)) { Remove-EventLog -Source $EventSource } } catch { }
+    foreach ($src in $EventSource, $TwSource) {
+        try { if ([Diagnostics.EventLog]::SourceExists($src)) { Remove-EventLog -Source $src } } catch { }
+    }
     $script:RemoveAppDir = $true
 }
 
@@ -522,6 +557,7 @@ function Show-Status {
         'Servicio'            = $svc.Status
         "Escucha en $port"    = $listen
         'DLL cargadas'        = $mods
+        'Parches TermWrap'    = if ($mode -eq 'TermWrap') { $ev = Get-TermWrapReport $svcPid; if ($ev) { "$($ev.Id) $($ev.Properties[0].Value)" } else { '(sin informe)' } } else { '-' }
         'Sesiones remotas'    = Get-RemoteSessionCount
         'Varias por usuario'  = ((Get-ItemProperty $TsKey).fSingleSessionPerUser -eq 0)
         'Tarea programada'    = if ($task) { $task.State } else { 'no instalada' }

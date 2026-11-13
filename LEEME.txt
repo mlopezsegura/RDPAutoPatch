@@ -11,16 +11,23 @@ Desinstalar.bat      Quita la tarea, deja el termsrv.dll original de Windows y b
 RDPAutoPatch.ps1     El programa.
 TermWrap.dll         Parche dinamico de termsrv.dll.
 Zydis.dll            Desensamblador que usa TermWrap.dll.
+termwrap\            Codigo de TermWrap.dll: parches sobre llccd/TermWrap v0.7 (MIT) y build.ps1
+                     para compilarla (necesita git y Visual Studio Build Tools 2022 con C++).
+                     No hace falta copiarla a otros equipos.
 
 Instalado en: C:\Program Files\RDPAutoPatch (la tarea usa esa copia, no esta carpeta).
 Registro:     C:\Program Files\RDPAutoPatch\autopatch.log
 Eventos:      Visor de eventos > Aplicacion, origen RDPAutoPatch (solo cuando cambia el resultado)
               1000 OK | 1001 Pospuesto | 1002 Degradado (una sola sesion) | 1003 Error | 1004 Interferencia
+              Origen TermWrap, al arrancar el servicio: 100 parche de varias sesiones aplicado,
+              101 no aplicado (con el detalle de cada parche: ok, partial, failed o missing)
 
 Comportamiento:
 - Si TermWrap falla, se reintenta pasadas 24 h; tras 3 fallos se descarta hasta que Windows
   Update cambie termsrv.dll o se vuelva a ejecutar Instalar.bat.
 - Si el servicio se cae 2 o mas veces en una hora con TermWrap, cuenta como fallo.
+- Si TermWrap se carga pero no encuentra donde aplicar el parche de varias sesiones (evento
+  101), tambien cuenta como fallo: el servicio funcionaria, pero con una sola sesion.
 - Si hay sesiones remotas abiertas, el cambio se pospone y se aplica en cuanto un usuario
   cierra o desconecta su sesion y ya no queda ninguna conectada.
 

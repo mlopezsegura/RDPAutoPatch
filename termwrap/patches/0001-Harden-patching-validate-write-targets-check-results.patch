@@ -1,0 +1,572 @@
+From b562a768419c887d6d595deeef2d1bac1f18ff44 Mon Sep 17 00:00:00 2001
+From: mariolopez <mariolopez@jisap.com>
+Date: Fri, 13 Nov 2026 15:47:10 +0100
+Subject: [PATCH 1/2] Harden patching: validate write targets, check results,
+ avoid OOB reads
+
+- Route all code patches through writeCode(): reject targets outside an
+  executable section of termsrv.dll and report WriteProcessMemory failures.
+- Route data flags through writeFlag(): only write inside writable sections
+  instead of blindly dereferencing a decoded displacement.
+- Guard the "CUtils::" lookback when IsSingleSessionPerUser is not found
+  (previously read before the image base).
+- pattenMatch: never read past the mapped section or the pattern end.
+- findSection: compare 8-byte section names correctly.
+- findImportFunction: skip imports by ordinal.
+- PropertyDeviceAddr: only follow jumps with a relative immediate operand.
+- Initialise bRemoteConnAllowed_xref.
+- DllMain: fail the load if ServiceMain is missing, null-check
+  SvchostPushServiceGlobals, check Thread32First.
+- Log every applied patch (name + RVA) via OutputDebugString.
+- TermWrapTest: print a byte diff of the image before/after patch().
+
+Verified: identical patch output to v0.7 on termsrv.dll 10.0.26100.1,
+.9444, .9549 and .9818; unrelated DLLs no longer crash the test harness.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ TermWrap/DllMain.cpp    | 14 ++++++-
+ TermWrap/Patch.cpp      | 71 ++++++++++++++++++------------------
+ TermWrap/Utils.cpp      | 77 +++++++++++++++++++++++++++++++++++++--
+ TermWrapTest/Source.cpp | 81 +++++++++++++++++++++++++++++++++++++++--
+ 4 files changed, 200 insertions(+), 43 deletions(-)
+
+diff --git a/TermWrap/DllMain.cpp b/TermWrap/DllMain.cpp
+index 21eafb3..1295699 100644
+--- a/TermWrap/DllMain.cpp
++++ b/TermWrap/DllMain.cpp
+@@ -20,7 +20,10 @@ void SetThreadsState(bool Resume)
+ 	if (h != INVALID_HANDLE_VALUE)
+ 	{
+ 		Thread.dwSize = sizeof(THREADENTRY32);
+-		Thread32First(h, &Thread);
++		if (!Thread32First(h, &Thread)) {
++			CloseHandle(h);
++			return;
++		}
+ 		do
+ 		{
+ 			if (Thread.th32ThreadID != CurrTh && Thread.th32OwnerProcessID == CurrPr)
+@@ -45,7 +48,7 @@ void WINAPI ServiceMain(DWORD dwArgc, LPTSTR* lpszArgv)
+ 
+ void WINAPI SvchostPushServiceGlobals(void* lpGlobalData)
+ {
+-	_SvchostPushServiceGlobals(lpGlobalData);
++	if (_SvchostPushServiceGlobals) _SvchostPushServiceGlobals(lpGlobalData);
+ }
+ 
+ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpReserved)
+@@ -56,6 +59,13 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpReserved)
+ 
+ 		_ServiceMain = (SERVICEMAIN)GetProcAddress(hMod, "ServiceMain");
+ 		_SvchostPushServiceGlobals = (SVCHOSTPUSHSERVICEGLOBALS)GetProcAddress(hMod, "SvchostPushServiceGlobals");
++		// Without ServiceMain the service cannot run: fail the load instead of crashing svchost later
++		if (!_ServiceMain) {
++			OutputDebugStringA("TermWrap: ServiceMain not found in termsrv.dll\n");
++			FreeLibrary(hMod);
++			hMod = NULL;
++			return false;
++		}
+ 
+ 		SetThreadsState(false);
+ 		patch(hMod);
+diff --git a/TermWrap/Patch.cpp b/TermWrap/Patch.cpp
+index 892f30b..10c3472 100644
+--- a/TermWrap/Patch.cpp
++++ b/TermWrap/Patch.cpp
+@@ -21,7 +21,6 @@ static void LocalOnlyPatch(ZydisDecoder* decoder, size_t RVA, size_t base, size_
+ 	ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
+ 	auto IP = RVA + base;
+ 	target += base;
+-	SIZE_T written = 0;
+ 
+ 	while (ZYAN_SUCCESS(ZydisDecoderDecodeFull(decoder, (void*)IP, length, &instruction, operands)))
+ 	{
+@@ -76,8 +75,8 @@ static void LocalOnlyPatch(ZydisDecoder* decoder, size_t RVA, size_t base, size_
+ 				operands[1].reg.value != REG_IP ||
+ 				target != IP + operands[0].imm.value.u + instruction.length) break;
+ 
+-			if (instruction.raw.imm[0].offset == 2) WriteProcessMemory(GetCurrentProcess(), (void*)IP, "\x90\xE9", 2, &written);
+-			else WriteProcessMemory(GetCurrentProcess(), (void*)IP, "\xEB", 1, &written);
++			if (instruction.raw.imm[0].offset == 2) writeCode(__FUNCTION__, (void*)IP, "\x90\xE9", 2);
++			else writeCode(__FUNCTION__, (void*)IP, "\xEB", 1);
+ 
+ 			return;
+ 		}
+@@ -96,7 +95,6 @@ static void DefPolicyPatch(ZydisDecoder* decoder, size_t RVA, size_t base) {
+ 	auto mov_target = ZYDIS_REGISTER_NONE;
+ 	auto mov_base2 = ZYDIS_REGISTER_NONE;
+ 	auto mov_target2 = ZYDIS_REGISTER_NONE;
+-	SIZE_T written = 0;
+ 
+ 	while (ZYAN_SUCCESS(ZydisDecoderDecodeFull(decoder, (void*)IP, length, &instruction, operands)))
+ 	{
+@@ -116,7 +114,7 @@ static void DefPolicyPatch(ZydisDecoder* decoder, size_t RVA, size_t base) {
+ 				{
+ 					if (lastLength == 7) {
+ 						if (mov_base == ZYDIS_REGISTER_RDI)
+-							WriteProcessMemory(GetCurrentProcess(), (void*)(IP - lastLength), "\xC7\x87\x38\x06\x00\x00\x00\x01\x00\x00\xEB", 11, &written);
++							writeCode(__FUNCTION__, (void*)(IP - lastLength), "\xC7\x87\x38\x06\x00\x00\x00\x01\x00\x00\xEB", 11);
+ 						else
+ 							OutputDebugStringA("DefPolicyPatch: Unknown reg2\n");
+ 					}
+@@ -129,7 +127,7 @@ static void DefPolicyPatch(ZydisDecoder* decoder, size_t RVA, size_t base) {
+ 
+ 				if (mov_target2 == ZYDIS_REGISTER_EDI) {
+ 					if (mov_base == ZYDIS_REGISTER_RCX)
+-						WriteProcessMemory(GetCurrentProcess(), (void*)(IP - lastLength), "\xBF\x00\x01\x00\x00\x89\xB9\x38\x06\x00\x00\x90\x90\x90", 14, &written);
++						writeCode(__FUNCTION__, (void*)(IP - lastLength), "\xBF\x00\x01\x00\x00\x89\xB9\x38\x06\x00\x00\x90\x90\x90", 14);
+ 					else
+ 						OutputDebugStringA("DefPolicyPatch: Unknown reg2\n");
+ 				}
+@@ -165,14 +163,14 @@ static void DefPolicyPatch(ZydisDecoder* decoder, size_t RVA, size_t base) {
+ 
+ 				switch (reg2) {
+ 				case ZYDIS_REGISTER_ECX:
+-					WriteProcessMemory(GetCurrentProcess(), (void*)IP, "\xB8\x00\x01\x00\x00\x89\x81\x20\x03\x00\x00\xEB\x0E", 13, &written);
++					writeCode(__FUNCTION__, (void*)IP, "\xB8\x00\x01\x00\x00\x89\x81\x20\x03\x00\x00\xEB\x0E", 13);
+ 					break;
+ #ifdef _WIN64
+ 				case ZYDIS_REGISTER_RCX:
+-					WriteProcessMemory(GetCurrentProcess(), (void*)IP, "\xB8\x00\x01\x00\x00\x89\x81\x38\x06\x00\x00\x90\xEB", 13, &written);
++					writeCode(__FUNCTION__, (void*)IP, "\xB8\x00\x01\x00\x00\x89\x81\x38\x06\x00\x00\x90\xEB", 13);
+ 					break;
+ 				case ZYDIS_REGISTER_RDI:
+-					WriteProcessMemory(GetCurrentProcess(), (void*)IP, "\xB8\x00\x01\x00\x00\x89\x87\x38\x06\x00\x00\x90\xEB", 13, &written);
++					writeCode(__FUNCTION__, (void*)IP, "\xB8\x00\x01\x00\x00\x89\x87\x38\x06\x00\x00\x90\xEB", 13);
+ 					break;
+ #endif
+ 				default:
+@@ -189,7 +187,7 @@ static void DefPolicyPatch(ZydisDecoder* decoder, size_t RVA, size_t base) {
+ 					OutputDebugStringA("DefPolicyPatch: Unknown reg2\n");
+ 					return;
+ 				}
+-				WriteProcessMemory(GetCurrentProcess(), (void*)IP, "\xBA\x00\x01\x00\x00\x89\x91\x20\x03\x00\x00\x5E\x90", 13, &written);
++				writeCode(__FUNCTION__, (void*)IP, "\xBA\x00\x01\x00\x00\x89\x91\x20\x03\x00\x00\x5E\x90", 13);
+ 				return;
+ 			}
+ 			else if (reg1 != ZYDIS_REGISTER_EAX) {
+@@ -199,17 +197,17 @@ static void DefPolicyPatch(ZydisDecoder* decoder, size_t RVA, size_t base) {
+ 
+ 			switch (reg2) {
+ 			case ZYDIS_REGISTER_ECX:
+-				WriteProcessMemory(GetCurrentProcess(), (void*)IP, "\xB8\x00\x01\x00\x00\x89\x81\x24\x03\x00\x00\x90", 12, &written);
++				writeCode(__FUNCTION__, (void*)IP, "\xB8\x00\x01\x00\x00\x89\x81\x24\x03\x00\x00\x90", 12);
+ 				break;
+ 			case ZYDIS_REGISTER_ESI:
+-				WriteProcessMemory(GetCurrentProcess(), (void*)IP, "\xB8\x00\x01\x00\x00\x89\x86\x20\x03\x00\x00\x90", 12, &written);
++				writeCode(__FUNCTION__, (void*)IP, "\xB8\x00\x01\x00\x00\x89\x86\x20\x03\x00\x00\x90", 12);
+ 				break;
+ #ifdef _WIN64
+ 			case ZYDIS_REGISTER_RCX:
+-				WriteProcessMemory(GetCurrentProcess(), (void*)IP, "\xB8\x00\x01\x00\x00\x89\x81\x38\x06\x00\x00\x90", 12, &written);
++				writeCode(__FUNCTION__, (void*)IP, "\xB8\x00\x01\x00\x00\x89\x81\x38\x06\x00\x00\x90", 12);
+ 				break;
+ 			case ZYDIS_REGISTER_RDI:
+-				WriteProcessMemory(GetCurrentProcess(), (void*)IP, "\xB8\x00\x01\x00\x00\x89\x87\x38\x06\x00\x00\x90", 12, &written);
++				writeCode(__FUNCTION__, (void*)IP, "\xB8\x00\x01\x00\x00\x89\x87\x38\x06\x00\x00\x90", 12);
+ 				break;
+ #endif
+ 			default:
+@@ -251,7 +249,6 @@ static int SingleUserPatch(ZydisDecoder* decoder, size_t RVA, size_t base, size_
+ 	auto IP = RVA + base;
+ 	target += base;
+ 	target2 += base;
+-	SIZE_T written = 0;
+ 
+ 	while (ZYAN_SUCCESS(ZydisDecoderDecodeFull(decoder, (void*)IP, length, &instruction, operands)))
+ 	{
+@@ -290,14 +287,14 @@ static int SingleUserPatch(ZydisDecoder* decoder, size_t RVA, size_t base, size_
+ 					operands[0].mem.segment == ZYDIS_REGISTER_DS &&
+ 					operands[0].mem.disp.value == target2) {
+ 					// call VerifyVersionInfoW -> pop eax; add esp, 12
+-					WriteProcessMemory(GetCurrentProcess(), (void*)IP, "\x58\x83\xC4\x0C\x90\x90\x90", instruction.length, &written);
++					writeCode(__FUNCTION__, (void*)IP, "\x58\x83\xC4\x0C\x90\x90\x90", instruction.length);
+ 					return 1;
+ 				}
+ 				if (instruction.mnemonic == ZYDIS_MNEMONIC_CMP && instruction.length <= 8 &&
+ 					operands[0].type == ZYDIS_OPERAND_TYPE_MEMORY && operands[0].mem.base == ZYDIS_REGISTER_EBP &&
+ 					operands[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE && operands[1].imm.value.u == 1) {
+ 					// cmp [ebp+XX], 1 -> nop
+-					WriteProcessMemory(GetCurrentProcess(), (void*)IP, "\x90\x90\x90\x90\x90\x90\x90\x90", instruction.length, &written);
++					writeCode(__FUNCTION__, (void*)IP, "\x90\x90\x90\x90\x90\x90\x90\x90", instruction.length);
+ 					return 1;
+ 				}
+ #else
+@@ -307,7 +304,7 @@ static int SingleUserPatch(ZydisDecoder* decoder, size_t RVA, size_t base, size_
+ 					operands[0].mem.base == ZYDIS_REGISTER_RIP &&
+ 					operands[0].mem.disp.value + IP + instruction.length == target2) {
+ 					// call VerifyVersionInfoW -> mov eax, 1
+-					WriteProcessMemory(GetCurrentProcess(), (void*)IP, "\xB8\x01\x00\x00\x00\x90\x90", instruction.length, &written);
++					writeCode(__FUNCTION__, (void*)IP, "\xB8\x01\x00\x00\x00\x90\x90", instruction.length);
+ 					return 1;
+ 				}
+ 				if (instruction.mnemonic == ZYDIS_MNEMONIC_CMP &&
+@@ -316,7 +313,7 @@ static int SingleUserPatch(ZydisDecoder* decoder, size_t RVA, size_t base, size_
+ 					(operands[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE && operands[1].imm.value.u == 1 ||
+ 						operands[1].type == ZYDIS_OPERAND_TYPE_REGISTER)) {
+ 					// cmp [rbp/rsp+XX], 1 -> nop
+-					WriteProcessMemory(GetCurrentProcess(), (void*)IP, "\x90\x90\x90\x90\x90\x90\x90\x90", instruction.length, &written);
++					writeCode(__FUNCTION__, (void*)IP, "\x90\x90\x90\x90\x90\x90\x90\x90", instruction.length);
+ 					return 1;
+ 				}
+ #endif
+@@ -335,7 +332,6 @@ static int NonRDPPatch(ZydisDecoder* decoder, size_t RVA, size_t base, size_t ta
+ 	ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
+ 	auto IP = RVA + base;
+ 	target += base;
+-	SIZE_T written = 0;
+ 
+ 	while (ZYAN_SUCCESS(ZydisDecoderDecodeFull(decoder, (void*)IP, length, &instruction, operands)))
+ 	{
+@@ -353,7 +349,7 @@ static int NonRDPPatch(ZydisDecoder* decoder, size_t RVA, size_t base, size_t ta
+ 			// inc dword ptr [ecx/rcx]
+ 			// xor eax, eax
+ 			// nop
+-			WriteProcessMemory(GetCurrentProcess(), (void*)(IP - instruction.length), "\xFF\x01\x31\xC0\x90", 5, &written);
++			writeCode(__FUNCTION__, (void*)(IP - instruction.length), "\xFF\x01\x31\xC0\x90", 5);
+ 			return 1;
+ 		}
+ 	}
+@@ -383,7 +379,8 @@ static size_t PropertyDeviceAddr(ZydisDecoder* decoder, size_t RVA, size_t base,
+ 				IP += instruction.length;
+ 				length -= instruction.length;
+ 
+-				if (instruction.mnemonic == ZYDIS_MNEMONIC_JZ || instruction.mnemonic == ZYDIS_MNEMONIC_JMP)
++				if ((instruction.mnemonic == ZYDIS_MNEMONIC_JZ || instruction.mnemonic == ZYDIS_MNEMONIC_JMP) &&
++					operands[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE && operands[0].imm.is_relative == ZYAN_TRUE)
+ 					IP += (size_t)operands[0].imm.value.u;
+ 
+ 				else if (instruction.mnemonic == ZYDIS_MNEMONIC_CALL &&
+@@ -437,7 +434,6 @@ static void PropertyDevicePatch(ZydisDecoder* decoder, size_t RVA, size_t base)
+ 	ZydisDecodedInstruction instruction;
+ 	ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
+ 	auto IP = RVA + base;
+-	SIZE_T written = 0;
+ 
+ 	while (ZYAN_SUCCESS(ZydisDecoderDecodeFull(decoder, (void*)IP, length, &instruction, operands)))
+ 	{
+@@ -461,13 +457,13 @@ static void PropertyDevicePatch(ZydisDecoder* decoder, size_t RVA, size_t base)
+ 					if (readSetting("fDisablePNPRedir", 0) == 1) return;
+ 					switch (reg) {
+ 					case ZYDIS_REGISTER_EAX:
+-						WriteProcessMemory(GetCurrentProcess(), (void*)IP, "\xB8\x00\x00\x00\x00\x90", 3 + instruction.length, &written);
++						writeCode(__FUNCTION__, (void*)IP, "\xB8\x00\x00\x00\x00\x90", 3 + instruction.length);
+ 						break;
+ 					case ZYDIS_REGISTER_ECX:
+-						WriteProcessMemory(GetCurrentProcess(), (void*)IP, "\xB9\x00\x00\x00\x00\x90", 3 + instruction.length, &written);
++						writeCode(__FUNCTION__, (void*)IP, "\xB9\x00\x00\x00\x00\x90", 3 + instruction.length);
+ 						break;
+ 					case ZYDIS_REGISTER_ESI:
+-						WriteProcessMemory(GetCurrentProcess(), (void*)IP, "\xBE\x00\x00\x00\x00\x90", 3 + instruction.length, &written);
++						writeCode(__FUNCTION__, (void*)IP, "\xBE\x00\x00\x00\x00\x90", 3 + instruction.length);
+ 						break;
+ 					default:
+ 						OutputDebugStringA("PropertyPatch: Unknown reg\n");
+@@ -493,15 +489,15 @@ static void PropertyDevicePatch(ZydisDecoder* decoder, size_t RVA, size_t base)
+ 					if (readSetting("UseUniversalPrinterDriverFirst", 3) == 4) buf[1] = 4;
+ 					switch (reg) {
+ 					case ZYDIS_REGISTER_EAX:
+-						WriteProcessMemory(GetCurrentProcess(), (void*)target, buf, 3 + instruction.length, &written);
++						writeCode(__FUNCTION__, (void*)target, buf, 3 + instruction.length);
+ 						break;
+ 					case ZYDIS_REGISTER_ECX:
+ 						buf[0] = (char)0xb9;
+-						WriteProcessMemory(GetCurrentProcess(), (void*)target, buf, 3 + instruction.length, &written);
++						writeCode(__FUNCTION__, (void*)target, buf, 3 + instruction.length);
+ 						break;
+ 					case ZYDIS_REGISTER_ESI:
+ 						buf[0] = (char)0xbe;
+-						WriteProcessMemory(GetCurrentProcess(), (void*)target, buf, 3 + instruction.length, &written);
++						writeCode(__FUNCTION__, (void*)target, buf, 3 + instruction.length);
+ 						break;
+ 					default:
+ 						OutputDebugStringA("PropertyPatch: Unknown reg\n");
+@@ -523,6 +519,11 @@ void patch(HMODULE hMod)
+ 	auto text = findSection(pNT, ".text");
+ 	auto rdata = findSection(pNT, ".rdata");
+ 	if (!rdata) rdata = text;
++	if (!rdata) {
++		OutputDebugStringA("patch: no .text/.rdata section\n");
++		return;
++	}
++	setPatchImage(base, pNT);
+ 
+ 	auto CDefPolicy_Query = pattenMatch(base, rdata, Query, sizeof(Query) - 1);
+ 	auto GetInstanceOfTSLicense = pattenMatch(base, rdata, InstanceOfLicense, sizeof(InstanceOfLicense) - 1);
+@@ -530,7 +531,7 @@ void patch(HMODULE hMod)
+ 	auto IsAllowNonRDPStack = pattenMatch(base, rdata, NonRDP, sizeof(NonRDP));
+ 	auto IsSingleSessionPerUserEnabled = pattenMatch(base, rdata, SingleSessionEnabled, sizeof(SingleSessionEnabled) - 1);
+ 	auto IsSingleSessionPerUser = pattenMatch(base, rdata, "IsSingleSessionPerUser", sizeof("IsSingleSessionPerUser"));
+-	if (!memcmp((void*)(base + IsSingleSessionPerUser - 8), "CUtils::", 8)) IsSingleSessionPerUser -= 8;
++	if (IsSingleSessionPerUser != -1 && IsSingleSessionPerUser >= 8 && !memcmp((void*)(base + IsSingleSessionPerUser - 8), "CUtils::", 8)) IsSingleSessionPerUser -= 8;
+ 	auto IsLicenseTypeLocalOnly = pattenMatch(base, rdata, LocalOnly, sizeof(LocalOnly) - 1);
+ 	auto bRemoteConnAllowed = pattenMatch(base, rdata, AllowRemote, sizeof(AllowRemote));
+ 	auto GetConnectionProperty = pattenMatch(base, rdata, ConnectionProperty, sizeof(ConnectionProperty));
+@@ -548,7 +549,7 @@ void patch(HMODULE hMod)
+ 	if (pImportImage) VerifyVersion_addr = findImportFunction(pImportImage, base, "VerifyVersionInfoW");
+ 
+ 	size_t CDefPolicy_Query_addr = 0, GetInstanceOfTSLicense_addr = 0, IsSingleSessionPerUserEnabled_addr = 0, IsAllowNonRDPStack_addr = 0,
+-		IsSingleSessionPerUser_addr = 0, IsLicenseTypeLocalOnly_addr = 0, IsAppServerInstalled_addr = 0, GetConnectionProperty_addr = 0, bRemoteConnAllowed_xref;
++		IsSingleSessionPerUser_addr = 0, IsLicenseTypeLocalOnly_addr = 0, IsAppServerInstalled_addr = 0, GetConnectionProperty_addr = 0, bRemoteConnAllowed_xref = 0;
+ 	size_t CSLQuery_Initialize_addr = 0, CSLQuery_Initialize_len = 0x11000;
+ 
+ 	ZydisDecoder decoder;
+@@ -826,7 +827,7 @@ fin2:
+ 				operands[1].reg.value == ZYDIS_REGISTER_ESI))
+ 		{
+ 			found = true;
+-			*(DWORD*)(operands[0].mem.disp.value) = 1;
++			writeFlag("CSLQuery::Initialize", (size_t)operands[0].mem.disp.value);
+ 		}
+ 		else if (instruction.mnemonic == ZYDIS_MNEMONIC_MOV &&
+ 			operands[0].type == ZYDIS_OPERAND_TYPE_MEMORY &&
+@@ -865,7 +866,7 @@ fin2:
+ 				operands[1].reg.value == ZYDIS_REGISTER_EAX)
+ 			{
+ 				found = true;
+-				*(DWORD*)(operands[0].mem.disp.value + IP) = 1;
++				writeFlag("CSLQuery::Initialize", (size_t)(operands[0].mem.disp.value + IP));
+ 			}
+ 			else if (instruction.mnemonic == ZYDIS_MNEMONIC_LEA &&
+ 				operands[1].type == ZYDIS_OPERAND_TYPE_MEMORY &&
+@@ -907,7 +908,7 @@ fin2:
+ 				operands[1].type == ZYDIS_OPERAND_TYPE_REGISTER)
+ 			{
+ 				found = true;
+-				*(DWORD*)(operands[0].mem.disp.value + IP) = 1;
++				writeFlag("CSLQuery::Initialize", (size_t)(operands[0].mem.disp.value + IP));
+ 			}
+ 			else if (instruction.mnemonic == ZYDIS_MNEMONIC_LEA &&
+ 				operands[1].type == ZYDIS_OPERAND_TYPE_MEMORY &&
+@@ -933,6 +934,6 @@ fin2:
+ 		}
+ 	}
+ #endif
+-	if (bInitialized_addr) *(DWORD*)bInitialized_addr = 1;
++	if (bInitialized_addr) writeFlag("bInitialized", bInitialized_addr);
+ 	else OutputDebugStringA("bInitialized not found\n");
+ }
+diff --git a/TermWrap/Utils.cpp b/TermWrap/Utils.cpp
+index 89db8a6..df358f2 100644
+--- a/TermWrap/Utils.cpp
++++ b/TermWrap/Utils.cpp
+@@ -228,8 +228,9 @@ static PIMAGE_SECTION_HEADER findSection(PIMAGE_NT_HEADERS pNT, const char* str)
+ {
+ 	auto pSection = IMAGE_FIRST_SECTION(pNT);
+ 
++	// Section names are 8 bytes and not NUL-terminated when they use all 8
+ 	for (size_t i = 0; i < pNT->FileHeader.NumberOfSections; i++)
+-		if (CSTR_EQUAL == CompareStringA(LOCALE_INVARIANT, 0, (char*)pSection[i].Name, -1, str, -1))
++		if (!strncmp((char*)pSection[i].Name, str, IMAGE_SIZEOF_SHORT_NAME))
+ 			return pSection + i;
+ 
+ 	return NULL;
+@@ -238,13 +239,81 @@ static PIMAGE_SECTION_HEADER findSection(PIMAGE_NT_HEADERS pNT, const char* str)
+ static size_t pattenMatch(size_t base, PIMAGE_SECTION_HEADER pSection, const void* str, size_t size)
+ {
+ 	size_t rdata = base + pSection->VirtualAddress;
++	// Only the mapped part of the section is readable, and the pattern must fit inside it
++	size_t limit = pSection->SizeOfRawData;
++	if (pSection->Misc.VirtualSize && pSection->Misc.VirtualSize < limit) limit = pSection->Misc.VirtualSize;
+ 
+-	for (size_t i = 0; i < pSection->SizeOfRawData; i += 4)
++	for (size_t i = 0; i + size <= limit; i += 4)
+ 		if (!memcmp((void*)(rdata + i), str, size)) return pSection->VirtualAddress + i;
+ 
+ 	return -1;
+ }
+ 
++// Image being patched. Set by setPatchImage() before any write helper is used.
++static size_t g_imgBase = 0;
++static PIMAGE_NT_HEADERS g_imgNT = NULL;
++
++static void setPatchImage(size_t base, PIMAGE_NT_HEADERS pNT) {
++	g_imgBase = base;
++	g_imgNT = pNT;
++}
++
++// OutputDebugString "<name>: <msg> rva=0x<hex>\n" without depending on the CRT
++static void dbgRva(const char* name, const char* msg, size_t addr) {
++	char buf[160];
++	size_t n = 0;
++	for (const char* p = name; *p && n < 96; p++) buf[n++] = *p;
++	for (const char* p = msg; *p && n < 136; p++) buf[n++] = *p;
++	for (const char* p = " rva=0x"; *p; p++) buf[n++] = *p;
++	DWORD rva = (DWORD)(addr - g_imgBase);
++	for (int shift = 28; shift >= 0; shift -= 4) buf[n++] = "0123456789ABCDEF"[(rva >> shift) & 15];
++	buf[n++] = '\n';
++	buf[n] = 0;
++	OutputDebugStringA(buf);
++}
++
++// Section of the image that fully contains [addr, addr + len), or NULL
++static PIMAGE_SECTION_HEADER sectionOfRange(size_t addr, size_t len) {
++	if (!g_imgNT || addr < g_imgBase) return NULL;
++	size_t rva = addr - g_imgBase;
++	auto pSection = IMAGE_FIRST_SECTION(g_imgNT);
++
++	for (size_t i = 0; i < g_imgNT->FileHeader.NumberOfSections; i++) {
++		size_t start = pSection[i].VirtualAddress;
++		size_t size = pSection[i].Misc.VirtualSize;
++		if (rva >= start && len <= size && rva - start <= size - len) return pSection + i;
++	}
++	return NULL;
++}
++
++// Patch code. Refuses targets outside an executable section of the image and reports failures.
++static bool writeCode(const char* name, void* addr, const void* data, SIZE_T len) {
++	auto pSection = sectionOfRange((size_t)addr, len);
++	if (!pSection || !(pSection->Characteristics & IMAGE_SCN_MEM_EXECUTE)) {
++		dbgRva(name, ": write rejected, target is not code", (size_t)addr);
++		return false;
++	}
++	SIZE_T written = 0;
++	if (!WriteProcessMemory(GetCurrentProcess(), addr, data, len, &written) || written != len) {
++		dbgRva(name, ": write FAILED", (size_t)addr);
++		return false;
++	}
++	dbgRva(name, ": patched", (size_t)addr);
++	return true;
++}
++
++// Set a DWORD flag to 1. Refuses targets outside a writable section of the image.
++static bool writeFlag(const char* name, size_t addr) {
++	auto pSection = sectionOfRange(addr, sizeof(DWORD));
++	if (!pSection || !(pSection->Characteristics & IMAGE_SCN_MEM_WRITE)) {
++		dbgRva(name, ": flag rejected, target is not writable data", addr);
++		return false;
++	}
++	*(DWORD*)addr = 1;
++	dbgRva(name, ": flag set", addr);
++	return true;
++}
++
+ static PIMAGE_IMPORT_DESCRIPTOR findImportImage(PIMAGE_IMPORT_DESCRIPTOR pImportDescriptor, size_t base, LPCSTR str) {
+ 	while (pImportDescriptor->Name)
+ 	{
+@@ -258,7 +327,9 @@ static size_t findImportFunction(PIMAGE_IMPORT_DESCRIPTOR pImportDescriptor, siz
+ 	auto pThunk = (PIMAGE_THUNK_DATA)(pImportDescriptor->OriginalFirstThunk + base);
+ 	while (pThunk->u1.AddressOfData)
+ 	{
+-		if (!lstrcmpiA(((PIMAGE_IMPORT_BY_NAME)(pThunk->u1.AddressOfData + base))->Name, str))
++		// Imports by ordinal have no name to compare
++		if (!IMAGE_SNAP_BY_ORDINAL(pThunk->u1.Ordinal) &&
++			!lstrcmpiA(((PIMAGE_IMPORT_BY_NAME)(pThunk->u1.AddressOfData + base))->Name, str))
+ 			return (size_t)pThunk - base - pImportDescriptor->OriginalFirstThunk + pImportDescriptor->FirstThunk;
+ 		pThunk++;
+ 	}
+diff --git a/TermWrapTest/Source.cpp b/TermWrapTest/Source.cpp
+index 53740fd..500b8ff 100644
+--- a/TermWrapTest/Source.cpp
++++ b/TermWrapTest/Source.cpp
+@@ -1,4 +1,7 @@
+ #include <windows.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
+ 
+ #ifdef TEST_UMRDP
+ #define FILENAME L"umrdp.dll"
+@@ -16,8 +19,9 @@ LONG NTAPI VexHandler(PEXCEPTION_POINTERS ExceptionInfo) {
+ 			ULONG len = (ULONG)ExceptionRecord->ExceptionInformation[0];
+ 			ULONG_PTR str = ExceptionRecord->ExceptionInformation[1];
+ 			HANDLE hOut = GetStdHandle(STD_ERROR_HANDLE);
++			// WriteFile works for consoles, pipes and files; WriteConsoleA only for consoles
+ 			if (len)
+-				WriteConsoleA(hOut, (void *)str, len - 1, &len, 0);
++				WriteFile(hOut, (void *)str, len - 1, &len, 0);
+ 		}
+ 		return EXCEPTION_CONTINUE_EXECUTION;
+ 	}
+@@ -25,13 +29,84 @@ LONG NTAPI VexHandler(PEXCEPTION_POINTERS ExceptionInfo) {
+ 	return EXCEPTION_CONTINUE_SEARCH;
+ }
+ 
++static bool isReadable(const MEMORY_BASIC_INFORMATION& mbi) {
++	if (mbi.State != MEM_COMMIT) return false;
++	if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return false;
++	return true;
++}
++
++// Copy every readable page of the image; unreadable pages stay zero in both snapshots
++static BYTE* snapshot(size_t base, size_t size) {
++	auto buf = (BYTE*)calloc(size, 1);
++	if (!buf) return NULL;
++	size_t off = 0;
++	while (off < size) {
++		MEMORY_BASIC_INFORMATION mbi;
++		if (!VirtualQuery((void*)(base + off), &mbi, sizeof(mbi))) break;
++		size_t regionEnd = (size_t)mbi.BaseAddress + mbi.RegionSize - base;
++		if (regionEnd > size) regionEnd = size;
++		if (isReadable(mbi)) memcpy(buf + off, (void*)(base + off), regionEnd - off);
++		off = regionEnd;
++	}
++	return buf;
++}
++
++static const char* sectionOf(PIMAGE_NT_HEADERS pNT, size_t rva, char* name) {
++	auto pSection = IMAGE_FIRST_SECTION(pNT);
++	for (WORD i = 0; i < pNT->FileHeader.NumberOfSections; i++)
++		if (rva >= pSection[i].VirtualAddress && rva < (size_t)pSection[i].VirtualAddress + pSection[i].Misc.VirtualSize) {
++			memcpy(name, pSection[i].Name, 8);
++			name[8] = 0;
++			return name;
++		}
++	return "?";
++}
++
++// Print every run of bytes changed by patch(), so results can be compared between builds
++static int printDiff(size_t base, PIMAGE_NT_HEADERS pNT, const BYTE* before, const BYTE* after, size_t size) {
++	int runs = 0;
++	char name[9];
++	for (size_t i = 0; i < size; i++) {
++		if (before[i] == after[i]) continue;
++		size_t end = i + 1, last = i;
++		// merge changed bytes separated by fewer than 4 unchanged bytes into one run
++		while (end < size && end - last <= 4) {
++			if (before[end] != after[end]) last = end;
++			end++;
++		}
++		printf("PATCH rva=%08zX %-8s old=", i, sectionOf(pNT, i, name));
++		for (size_t j = i; j <= last; j++) printf("%02X", before[j]);
++		printf(" new=");
++		for (size_t j = i; j <= last; j++) printf("%02X", after[j]);
++		printf("\n");
++		runs++;
++		i = last;
++	}
++	return runs;
++}
++
+ int main(int argc, char** argv)
+ {
+ 	HMODULE hMod;
+ 	if (argc >= 2) hMod = LoadLibraryExA(argv[1], NULL, DONT_RESOLVE_DLL_REFERENCES);
+ 	else hMod = LoadLibraryExW(FILENAME, NULL, DONT_RESOLVE_DLL_REFERENCES | LOAD_LIBRARY_SEARCH_SYSTEM32);
+-	if (!hMod) return -1;
++	if (!hMod) {
++		fprintf(stderr, "LoadLibrary failed: %lu\n", GetLastError());
++		return -1;
++	}
+ 	AddVectoredExceptionHandler(TRUE, VexHandler);
++
++	auto base = (size_t)hMod;
++	auto pNT = (PIMAGE_NT_HEADERS)(base + ((PIMAGE_DOS_HEADER)base)->e_lfanew);
++	size_t size = pNT->OptionalHeader.SizeOfImage;
++
++	auto before = snapshot(base, size);
+ 	patch(hMod);
++	auto after = snapshot(base, size);
++	if (!before || !after) return -2;
++
++	fflush(stderr);
++	int runs = printDiff(base, pNT, before, after, size);
++	printf("TOTAL %d patched location(s)\n", runs);
+ 	return 0;
+-}
+\ No newline at end of file
++}
+-- 
+2.53.0.windows.2
+
