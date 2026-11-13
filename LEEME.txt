@@ -4,7 +4,7 @@ Carpeta autocontenida: para llevarlo a otro equipo basta con copiar esta carpeta
 
 Instalar.bat         Instala o actualiza, retira el RDP Wrapper clasico, crea la tarea y comprueba
                      (pide administrador). Vuelve a ejecutarlo si cambias algun archivo de aqui
-                     o si TermWrap quedo marcado como fallido y quieres reintentarlo.
+                     o si TermWrap quedo descartado y quieres reintentarlo ya.
 Estado.bat           Muestra el estado sin cambiar nada.
 Comprobar_ahora.bat  Fuerza una comprobacion/correccion ahora (pide administrador).
 Desinstalar.bat      Quita la tarea, deja el termsrv.dll original de Windows y borra la instalacion.
@@ -14,6 +14,15 @@ Zydis.dll            Desensamblador que usa TermWrap.dll.
 
 Instalado en: C:\Program Files\RDPAutoPatch (la tarea usa esa copia, no esta carpeta).
 Registro:     C:\Program Files\RDPAutoPatch\autopatch.log
+Eventos:      Visor de eventos > Aplicacion, origen RDPAutoPatch (solo cuando cambia el resultado)
+              1000 OK | 1001 Pospuesto | 1002 Degradado (una sola sesion) | 1003 Error | 1004 Interferencia
+
+Comportamiento:
+- Si TermWrap falla, se reintenta pasadas 24 h; tras 3 fallos se descarta hasta que Windows
+  Update cambie termsrv.dll o se vuelva a ejecutar Instalar.bat.
+- Si el servicio se cae 2 o mas veces en una hora con TermWrap, cuenta como fallo.
+- Si hay sesiones remotas abiertas, el cambio se pospone y se aplica en cuanto un usuario
+  cierra o desconecta su sesion y ya no queda ninguna conectada.
 
 No instales ni ejecutes el RDP Wrapper clasico (autoupdate.bat, RDPWInst, RDPConf): cambia el
 servicio por su cuenta y hace que se pierda el modo de varias sesiones.

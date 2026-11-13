@@ -8,8 +8,15 @@ Modos, por orden de preferencia:
   2. Original  : termsrv.dll de Windows sin parche (una sola sesion, pero el RDP sigue funcionando)
 
 Despues de cada cambio comprueba que el servicio arranca, sigue estable, escucha en el puerto
-y tiene cargada la DLL esperada. Si no, marca ese modo como fallido para esa version de
-termsrv.dll y pasa al siguiente. Si Windows Update cambia termsrv.dll, vuelve a intentarlo.
+y tiene cargada la DLL esperada. Si no, anota el fallo de ese modo para esa version de
+termsrv.dll y pasa al siguiente. Un modo que ha fallado se reintenta pasadas 24 h; tras 3 fallos
+se descarta hasta que cambie termsrv.dll o se reinstale. Si se cae 2 o mas veces en una hora,
+cuenta como fallo aunque en ese momento este en marcha.
+
+La tarea programada se ejecuta al arrancar, cada 4 horas, cuando se cae TermService y cuando un
+usuario cierra o desconecta su sesion (para aplicar enseguida un cambio pospuesto).
+Los cambios de resultado se anotan en el registro de eventos Aplicacion, origen RDPAutoPatch:
+  1000 OK | 1001 Pospuesto | 1002 Degradado (una sola sesion) | 1003 Error | 1004 Interferencia
 
 Programa autocontenido: la carpeta de distribucion lleva este script, TermWrap.dll, Zydis.dll y
 los .bat. -Install lo copia todo a C:\Program Files\RDPAutoPatch (ruta protegida: el servicio
@@ -46,6 +53,10 @@ $OldWrapDir = 'C:\Program Files\RDP Wrapper'
 $OldUninstallKeys = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\RDPWrap with Autoupdate 1.4',
                     'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\RDPWrap with Autoupdate 1.4'
 $script:ExitCode = 0
+$MaxFailures = 3       # fallos de un modo antes de descartarlo para esa version de termsrv.dll
+$RetryHours  = 24      # espera antes de reintentar un modo que ha fallado
+$EventSource = 'RDPAutoPatch'
+$EventIds    = @{ OK = 1000, 'Information'; Pospuesto = 1001, 'Warning'; Degradado = 1002, 'Warning'; Error = 1003, 'Error'; Interferencia = 1004, 'Error' }
 
 $Modes = [ordered]@{
     TermWrap = @{ Dll = "$AppDir\TermWrap.dll"; Deps = @("$AppDir\Zydis.dll"); Module = 'TermWrap.dll' }
@@ -96,7 +107,7 @@ function Get-Sha256([string]$Path) {
 }
 
 function Read-State {
-    $s = @{ TermsrvVersion = ''; Mode = ''; LastResult = ''; LastCheck = ''; Bad = @{}; Pins = @{} }
+    $s = @{ TermsrvVersion = ''; Mode = ''; ModeSince = ''; LastResult = ''; LastCheck = ''; Bad = @{}; Pins = @{} }
     if (Test-Path $StateFile) {
         try {
             $j = Get-Content $StateFile -Raw | ConvertFrom-Json
@@ -115,6 +126,38 @@ function Read-State {
 function Save-State($State) {
     $State.LastCheck = (Get-Date).ToString('s')
     ($State | ConvertTo-Json -Depth 4) | Set-Content -Path $StateFile -Encoding UTF8
+}
+
+# Fallos anotados de un modo: { Count; Last; Reason }. Admite el formato antiguo ($true).
+function Get-Failure($State, [string]$Key) {
+    if (-not $State.Bad.ContainsKey($Key)) { return $null }
+    $b = $State.Bad[$Key]
+    if ($b -is [bool]) { return [pscustomobject]@{ Count = 1; Last = ''; Reason = 'fallo anterior sin detalle' } }
+    $b
+}
+
+function Add-Failure($State, [string]$Mode, [string]$Ver, [string]$Reason) {
+    $key = "$Mode@$Ver"
+    $old = Get-Failure $State $key
+    $n = if ($old) { [int]$old.Count + 1 } else { 1 }
+    $State.Bad[$key] = [pscustomobject]@{ Count = $n; Last = (Get-Date).ToString('s'); Reason = $Reason }
+    if ($n -ge $MaxFailures) { Write-Log "Modo $Mode descartado para termsrv.dll $Ver tras $n fallos" ERROR }
+    else { Write-Log "Modo ${Mode}: fallo $n de $MaxFailures; se reintentara pasadas $RetryHours h" WARN }
+}
+
+function Write-AppEvent([string]$Result, [string]$Message) {
+    try {
+        if (-not [Diagnostics.EventLog]::SourceExists($EventSource)) { New-EventLog -LogName Application -Source $EventSource }
+        Write-EventLog -LogName Application -Source $EventSource -EventId $EventIds[$Result][0] -EntryType $EventIds[$Result][1] -Message $Message
+    } catch { Write-Log "No se pudo escribir en el registro de eventos: $_" WARN }
+}
+
+# Guarda el resultado y lo anota en el registro de eventos si ha cambiado (los errores, siempre)
+function Complete-Check($State, [string]$Result, [string]$Message) {
+    $prev = $State.LastResult
+    $State.LastResult = $Result
+    Save-State $State
+    if ($Result -ne $prev -or $Result -in 'Error', 'Interferencia') { Write-AppEvent $Result $Message }
 }
 
 function Backup-Params {
@@ -168,6 +211,13 @@ function Restart-TermService {
     Start-Service UmRdpService -ErrorAction SilentlyContinue
 }
 
+# Cierres inesperados de TermService (eventos 7031/7034) desde la fecha indicada
+function Get-TsCrashes([datetime]$Since) {
+    $display = (Get-Service TermService).DisplayName
+    , @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Service Control Manager'; Id = 7031, 7034; StartTime = $Since } -ErrorAction SilentlyContinue |
+        Where-Object { $_.Properties[0].Value -eq $display })
+}
+
 # Devuelve la lista de problemas (vacia = sano)
 function Get-HealthProblems([string]$Mode, [datetime]$Since, [int]$SettleSeconds) {
     $problems = New-Object System.Collections.Generic.List[string]
@@ -186,9 +236,7 @@ function Get-HealthProblems([string]$Mode, [datetime]$Since, [int]$SettleSeconds
         Where-Object OwningProcess -eq $pid2
     if (-not $listen) { $problems.Add("el servicio no escucha en el puerto $port") }
 
-    $display = (Get-Service TermService).DisplayName
-    $crashes = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Service Control Manager'; Id = 7031, 7034; StartTime = $Since } -ErrorAction SilentlyContinue |
-        Where-Object { $_.Properties[0].Value -eq $display })
+    $crashes = Get-TsCrashes $Since
     if ($crashes.Count) { $problems.Add("$($crashes.Count) cierre(s) inesperado(s) del servicio") }
 
     try {
@@ -208,7 +256,14 @@ function Get-ModeProblem([string]$Mode, [string]$Ver, $State) {
     if (-not (Test-Path $dll)) { return "no existe $dll" }
     if ($Mode -eq 'Original') { return $null }   # ultimo recurso, siempre disponible
     foreach ($d in $m.Deps) { if (-not (Test-Path $d)) { return "falta $d" } }
-    if ($State.Bad.ContainsKey("$Mode@$Ver")) { return "ya fallo con termsrv.dll $Ver (ejecuta Instalar.bat para reintentar)" }
+    $f = Get-Failure $State "$Mode@$Ver"
+    if ($f) {
+        if ([int]$f.Count -ge $MaxFailures) { return "fallo $($f.Count) veces con termsrv.dll $Ver ($($f.Reason)); ejecuta Instalar.bat para reintentar" }
+        if ($f.Last) {
+            $next = ([datetime]$f.Last).AddHours($RetryHours)
+            if ((Get-Date) -lt $next) { return "fallo $($f.Count) de $MaxFailures ($($f.Reason)); se reintenta a partir de $($next.ToString('yyyy-MM-dd HH:mm'))" }
+        }
+    }
     foreach ($f in $PinnedFiles) {
         $name = Split-Path $f -Leaf
         if (-not $State.Pins.ContainsKey($name)) { return "$name sin huella registrada (ejecuta Instalar.bat)" }
@@ -244,19 +299,34 @@ function Invoke-Check {
     if ($candidates.Count -and $current -eq $candidates[0]) {
         $since = try { (Get-Process -Id (Get-TsProcessId) -ErrorAction Stop).StartTime } catch { (Get-Date).AddMinutes(-10) }
         $p = Get-HealthProblems $current $since 3
+        if ($current -ne 'Original') {
+            # Caidas repetidas: el servicio puede estar en marcha ahora y aun asi reiniciarse cada poco
+            $win = (Get-Date).AddHours(-1)
+            if ($state.Mode -eq $current -and $state.ModeSince -and ([datetime]$state.ModeSince) -gt $win) { $win = [datetime]$state.ModeSince }
+            $n = (Get-TsCrashes $win).Count
+            if ($n -ge 2) { $p.Add("$n caidas del servicio en la ultima hora") }
+        }
         if ($p.Count -eq 0) {
             Write-Log "Todo correcto: modo $current activo y estable" OK
-            $state.Mode = $current; $state.LastResult = 'OK'; Save-State $state
+            if ($state.Mode -ne $current -or -not $state.ModeSince) { $state.ModeSince = $since.ToString('s') }
+            $state.Mode = $current
+            $key = "$current@$ver"
+            if ($state.Bad.ContainsKey($key) -and ([datetime]$state.ModeSince) -lt (Get-Date).AddDays(-7)) {
+                $state.Bad.Remove($key)
+                Write-Log "Modo $current estable mas de 7 dias; se olvidan sus fallos anteriores"
+            }
+            Complete-Check $state 'OK' "Modo $current activo y estable (termsrv.dll $ver)"
             return
         }
         Write-Log ("Modo $current con problemas: " + ($p -join '; ')) WARN
-        if ($current -ne 'Original') { $state.Bad["$current@$ver"] = $true; [void]$candidates.Remove($current) }
+        if ($current -ne 'Original') { Add-Failure $state $current $ver ($p -join '; '); [void]$candidates.Remove($current) }
     }
 
     $remote = Get-RemoteSessionCount
     if ($remote -gt 0 -and -not $Force -and (Get-Service TermService).Status -eq 'Running') {
-        Write-Log "Hay $remote sesion(es) remota(s) abierta(s); el cambio se pospone para no cortarlas (usa -Force para forzarlo)" WARN
-        $state.LastResult = 'Pospuesto'; Save-State $state
+        $msg = "Hay $remote sesion(es) remota(s) abierta(s); el cambio se pospone para no cortarlas y se aplicara al cerrarse o desconectarse (usa -Force para forzarlo)"
+        Write-Log $msg WARN
+        Complete-Check $state 'Pospuesto' $msg
         $script:ExitCode = 2
         return
     }
@@ -269,28 +339,32 @@ function Invoke-Check {
         $since = Get-Date
         $p = Get-HealthProblems $m $since 15
         if ((Get-ModeFromDll (Get-ServiceDll)) -ne $m) {
-            Write-Log "Otro programa ha cambiado el servicio a '$(Get-ServiceDll)' mientras se probaba $m; no se marca como fallido" ERROR
-            $state.LastResult = 'Interferencia'; Save-State $state
+            $msg = "Otro programa ha cambiado el servicio a '$(Get-ServiceDll)' mientras se probaba $m; no se cuenta como fallo"
+            Write-Log $msg ERROR
+            Complete-Check $state 'Interferencia' $msg
             $script:ExitCode = 1
             return
         }
+        $state.Mode = $m
+        $state.ModeSince = $since.ToString('s')
         if ($p.Count -eq 0) {
             if ($m -eq 'Original') {
-                Write-Log 'TermWrap no funciona con esta version; RDP activo en modo original de Windows (una sola sesion)' WARN
-                $state.LastResult = 'Degradado'
+                $msg = "TermWrap no funciona con termsrv.dll $ver; RDP activo en modo original de Windows (una sola sesion)"
+                Write-Log $msg WARN
+                Complete-Check $state 'Degradado' $msg
             } else {
                 Write-Log "Modo $m aplicado y estable" OK
-                $state.LastResult = 'OK'
+                Complete-Check $state 'OK' "Modo $m aplicado y estable (termsrv.dll $ver)"
             }
-            $state.Mode = $m; Save-State $state
             return
         }
         Write-Log ("Modo $m fallido: " + ($p -join '; ')) ERROR
-        if ($m -ne 'Original') { $state.Bad["$m@$ver"] = $true }
+        if ($m -ne 'Original') { Add-Failure $state $m $ver ($p -join '; ') }
         Save-State $state
     }
-    Write-Log 'Ningun modo ha funcionado; revisa el servicio a mano' ERROR
-    $state.LastResult = 'Error'; Save-State $state
+    $msg = 'Ningun modo ha funcionado; revisa el servicio a mano'
+    Write-Log $msg ERROR
+    Complete-Check $state 'Error' $msg
     $script:ExitCode = 1
 }
 
@@ -327,7 +401,15 @@ function Invoke-Install {
     foreach ($f in $AppFiles) {
         if (-not (Test-Path (Join-Path $src $f))) { throw "Falta $f en $src; la carpeta del programa debe llevarlo" }
     }
+    $remote = Get-RemoteSessionCount
+    if ($remote -gt 0) {
+        Write-Log ("Hay $remote sesion(es) remota(s). Si hay que soltar DLL antiguas o retirar el RDP Wrapper clasico, " +
+            'el servicio se reinicia y esas conexiones se cortaran unos segundos. El cambio de modo final se pospone hasta que se cierren.') WARN
+    }
     Backup-Params
+    try {
+        if (-not [Diagnostics.EventLog]::SourceExists($EventSource)) { New-EventLog -LogName Application -Source $EventSource; Write-Log "Origen de eventos '$EventSource' registrado" }
+    } catch { Write-Log "No se pudo registrar el origen de eventos: $_" WARN }
 
     # Copiar programa y DLL a la carpeta protegida (si cambian las DLL, soltarlas antes)
     if ($src -ine $AppDir) {
@@ -351,6 +433,14 @@ function Invoke-Install {
     Save-State $state
 
     $dest = Join-Path $AppDir 'RDPAutoPatch.ps1'
+    # Disparador de caidas: solo las de TermService (param1 es su nombre visible, que depende del idioma)
+    $crashSel = "*[System[Provider[@Name='Service Control Manager'] and (EventID=7031 or EventID=7034)]]"
+    $display = (Get-Service TermService).DisplayName
+    if ($display -notmatch "['`"<>&]") { $crashSel = $crashSel.TrimEnd(']') + "] and EventData[Data[@Name='param1']='$display']]" }
+    $crashQuery = [Security.SecurityElement]::Escape("<QueryList><Query Id=`"0`" Path=`"System`"><Select Path=`"System`">$crashSel</Select></Query></QueryList>")
+    # Disparador de cierre (23) o desconexion (24) de sesion: aplica cuanto antes un cambio pospuesto
+    $lsm = 'Microsoft-Windows-TerminalServices-LocalSessionManager/Operational'
+    $sessionQuery = [Security.SecurityElement]::Escape("<QueryList><Query Id=`"0`" Path=`"$lsm`"><Select Path=`"$lsm`">*[System[(EventID=23 or EventID=24)]]</Select></Query></QueryList>")
     $xml = @"
 <?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
@@ -366,7 +456,12 @@ function Invoke-Install {
     <EventTrigger>
       <Enabled>true</Enabled>
       <Delay>PT30S</Delay>
-      <Subscription>&lt;QueryList&gt;&lt;Query Id="0" Path="System"&gt;&lt;Select Path="System"&gt;*[System[Provider[@Name='Service Control Manager'] and (EventID=7031 or EventID=7034)]]&lt;/Select&gt;&lt;/Query&gt;&lt;/QueryList&gt;</Subscription>
+      <Subscription>$crashQuery</Subscription>
+    </EventTrigger>
+    <EventTrigger>
+      <Enabled>true</Enabled>
+      <Delay>PT1M</Delay>
+      <Subscription>$sessionQuery</Subscription>
     </EventTrigger>
   </Triggers>
   <Principals><Principal id="Author"><UserId>S-1-5-18</UserId><RunLevel>HighestAvailable</RunLevel></Principal></Principals>
@@ -387,7 +482,7 @@ function Invoke-Install {
 </Task>
 "@
     Register-ScheduledTask -TaskName $TaskName -Xml $xml -Force | Out-Null
-    Write-Log "Tarea programada '$TaskName' creada (al arrancar, cada 4 horas y si el servicio se cae)" OK
+    Write-Log "Tarea programada '$TaskName' creada (al arrancar, cada 4 horas, si el servicio se cae y al cerrar o desconectar una sesion)" OK
     Invoke-Check
 }
 
@@ -403,6 +498,7 @@ function Invoke-Uninstall {
     Set-ServiceDll $Modes.Original.Dll
     Restart-TermService
     Write-Log 'Servicio devuelto a termsrv.dll original de Windows' OK
+    try { if ([Diagnostics.EventLog]::SourceExists($EventSource)) { Remove-EventLog -Source $EventSource } } catch { }
     $script:RemoveAppDir = $true
 }
 
@@ -422,6 +518,7 @@ function Show-Status {
         'termsrv.dll'         = $ver
         'ServiceDll'          = $dll
         'Modo'                = $mode
+        'Modo activo desde'   = $state.ModeSince
         'Servicio'            = $svc.Status
         "Escucha en $port"    = $listen
         'DLL cargadas'        = $mods
