@@ -1,0 +1,19 @@
+RDPAutoPatch - mantiene el Escritorio remoto parcheado (varias sesiones, tambien del mismo usuario)
+
+Carpeta autocontenida: para llevarlo a otro equipo basta con copiar esta carpeta entera.
+
+Instalar.bat         Instala o actualiza, retira el RDP Wrapper clasico, crea la tarea y comprueba
+                     (pide administrador). Vuelve a ejecutarlo si cambias algun archivo de aqui
+                     o si TermWrap quedo marcado como fallido y quieres reintentarlo.
+Estado.bat           Muestra el estado sin cambiar nada.
+Comprobar_ahora.bat  Fuerza una comprobacion/correccion ahora (pide administrador).
+Desinstalar.bat      Quita la tarea, deja el termsrv.dll original de Windows y borra la instalacion.
+RDPAutoPatch.ps1     El programa.
+TermWrap.dll         Parche dinamico de termsrv.dll.
+Zydis.dll            Desensamblador que usa TermWrap.dll.
+
+Instalado en: C:\Program Files\RDPAutoPatch (la tarea usa esa copia, no esta carpeta).
+Registro:     C:\Program Files\RDPAutoPatch\autopatch.log
+
+No instales ni ejecutes el RDP Wrapper clasico (autoupdate.bat, RDPWInst, RDPConf): cambia el
+servicio por su cuenta y hace que se pierda el modo de varias sesiones.
