@@ -31,11 +31,13 @@ if (-not $msbuild) { throw 'No se encuentra MSBuild con las herramientas de C++'
 
 # Codigo original en el commit fijado, con su submodulo Zydis, y nuestros parches encima
 if (Test-Path $Src) { Remove-Item $Src -Recurse -Force }
-Invoke-Native 'git clone' { git clone -q $Upstream $Src }
+# Sin conversion de finales de linea: los parches se generaron contra el contenido exacto del repositorio
+Invoke-Native 'git clone' { git -c core.autocrlf=false clone -q $Upstream $Src }
 Invoke-Native 'git checkout' { git -C $Src checkout -q $Commit }
-Invoke-Native 'git submodule' { git -C $Src submodule update -q --init --recursive }
+Invoke-Native 'git submodule' { git -C $Src -c core.autocrlf=false submodule update -q --init --recursive }
+# De uno en uno: git apply con varios parches los compara todos con el codigo original
 $patches = @(Get-ChildItem (Join-Path $Here 'patches') -Filter *.patch | Sort-Object Name)
-Invoke-Native 'git apply' { git -C $Src apply --whitespace=nowarn @($patches.FullName) }
+foreach ($p in $patches) { Invoke-Native "git apply $($p.Name)" { git -C $Src apply --whitespace=nowarn $p.FullName } }
 Write-Host "Aplicados $($patches.Count) parche(s) sobre $($Commit.Substring(0, 8))"
 
 New-Item -ItemType Directory -Force $Out | Out-Null
