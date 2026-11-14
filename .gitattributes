@@ -1,0 +1,2 @@
+termwrap/patches/*.patch binary
+*.dll binary

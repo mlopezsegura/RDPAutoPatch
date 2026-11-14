@@ -1,0 +1,161 @@
+From a77d9a6635cb28fd0711c4d56d836750641d555f Mon Sep 17 00:00:00 2001
+From: mlopezsegura <90263997+mlopezsegura@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 16:43:21 +0100
+Subject: [PATCH 2/2] Report patch status to the Application event log
+
+Each write helper counts successes and failures per patch. From ServiceMain
+(not DllMain, to stay out of the loader lock) TermWrap writes one event with
+source "TermWrap": 100 when DefPolicyPatch (concurrent sessions) was applied,
+101 when it was not. The message lists every patch as ok, partial, failed or
+missing. TermWrapTest prints the same summary.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ TermWrap/DllMain.cpp    | 17 ++++++++++++++++
+ TermWrap/Utils.cpp      | 44 +++++++++++++++++++++++++++++++++++++++++
+ TermWrapTest/Source.cpp |  4 ++++
+ 3 files changed, 65 insertions(+)
+
+diff --git a/TermWrap/DllMain.cpp b/TermWrap/DllMain.cpp
+index 1295699..aa57a41 100644
+--- a/TermWrap/DllMain.cpp
++++ b/TermWrap/DllMain.cpp
+@@ -9,6 +9,21 @@ SERVICEMAIN _ServiceMain;
+ SVCHOSTPUSHSERVICEGLOBALS _SvchostPushServiceGlobals;
+ 
+ extern void patch(HMODULE hMod);
++extern bool buildPatchReport(char* buf, size_t size);
++
++// Writes the patch summary to the Application event log, source "TermWrap":
++// 100 = essential patch applied, 101 = essential patch missing (only one session).
++// Done from ServiceMain, not DllMain: the event log is an RPC call and must not run under the loader lock.
++static void reportPatchStatus()
++{
++	char msg[512];
++	bool ok = buildPatchReport(msg, sizeof(msg));
++	auto h = RegisterEventSourceA(NULL, "TermWrap");
++	if (!h) return;
++	LPCSTR strings[1] = { msg };
++	ReportEventA(h, ok ? EVENTLOG_INFORMATION_TYPE : EVENTLOG_WARNING_TYPE, 0, ok ? 100 : 101, NULL, 1, 0, strings, NULL);
++	DeregisterEventSource(h);
++}
+ 
+ void SetThreadsState(bool Resume)
+ {
+@@ -43,6 +58,8 @@ void SetThreadsState(bool Resume)
+ 
+ void WINAPI ServiceMain(DWORD dwArgc, LPTSTR* lpszArgv)
+ {
++	static LONG reported = 0;
++	if (!InterlockedExchange(&reported, 1)) reportPatchStatus();
+ 	_ServiceMain(dwArgc, lpszArgv);
+ }
+ 
+diff --git a/TermWrap/Utils.cpp b/TermWrap/Utils.cpp
+index df358f2..1ab3b48 100644
+--- a/TermWrap/Utils.cpp
++++ b/TermWrap/Utils.cpp
+@@ -272,6 +272,26 @@ static void dbgRva(const char* name, const char* msg, size_t addr) {
+ 	OutputDebugStringA(buf);
+ }
+ 
++// Result of each patch, counted by the write helpers. A patch with no writes was not found.
++struct PatchResult { const char* name; int ok; int bad; };
++static PatchResult g_results[] = {
++	{ "DefPolicyPatch", 0, 0 },
++	{ "SingleUserPatch", 0, 0 },
++	{ "LocalOnlyPatch", 0, 0 },
++	{ "NonRDPPatch", 0, 0 },
++	{ "PropertyDevicePatch", 0, 0 },
++	{ "CSLQuery::Initialize", 0, 0 },
++	{ "bInitialized", 0, 0 },
++};
++
++static void noteResult(const char* name, bool ok) {
++	for (auto& r : g_results)
++		if (!lstrcmpA(r.name, name)) {
++			if (ok) r.ok++; else r.bad++;
++			return;
++		}
++}
++
+ // Section of the image that fully contains [addr, addr + len), or NULL
+ static PIMAGE_SECTION_HEADER sectionOfRange(size_t addr, size_t len) {
+ 	if (!g_imgNT || addr < g_imgBase) return NULL;
+@@ -291,14 +311,17 @@ static bool writeCode(const char* name, void* addr, const void* data, SIZE_T len
+ 	auto pSection = sectionOfRange((size_t)addr, len);
+ 	if (!pSection || !(pSection->Characteristics & IMAGE_SCN_MEM_EXECUTE)) {
+ 		dbgRva(name, ": write rejected, target is not code", (size_t)addr);
++		noteResult(name, false);
+ 		return false;
+ 	}
+ 	SIZE_T written = 0;
+ 	if (!WriteProcessMemory(GetCurrentProcess(), addr, data, len, &written) || written != len) {
+ 		dbgRva(name, ": write FAILED", (size_t)addr);
++		noteResult(name, false);
+ 		return false;
+ 	}
+ 	dbgRva(name, ": patched", (size_t)addr);
++	noteResult(name, true);
+ 	return true;
+ }
+ 
+@@ -307,13 +330,34 @@ static bool writeFlag(const char* name, size_t addr) {
+ 	auto pSection = sectionOfRange(addr, sizeof(DWORD));
+ 	if (!pSection || !(pSection->Characteristics & IMAGE_SCN_MEM_WRITE)) {
+ 		dbgRva(name, ": flag rejected, target is not writable data", addr);
++		noteResult(name, false);
+ 		return false;
+ 	}
+ 	*(DWORD*)addr = 1;
+ 	dbgRva(name, ": flag set", addr);
++	noteResult(name, true);
+ 	return true;
+ }
+ 
++// Summary of the patch for whoever supervises the service:
++// "DefPolicyPatch=ok SingleUserPatch=missing ...". Each entry is ok, partial, failed or missing.
++// Returns true when the essential patch (DefPolicyPatch, concurrent sessions) was applied cleanly.
++bool buildPatchReport(char* buf, size_t size) {
++	size_t n = 0;
++	auto put = [&](const char* s) { for (; *s && n + 1 < size; s++) buf[n++] = *s; };
++	bool essential = false;
++	for (auto& r : g_results) {
++		const char* state = r.ok ? (r.bad ? "partial" : "ok") : (r.bad ? "failed" : "missing");
++		if (n) put(" ");
++		put(r.name);
++		put("=");
++		put(state);
++		if (!lstrcmpA(r.name, "DefPolicyPatch")) essential = r.ok && !r.bad;
++	}
++	if (size) buf[n] = 0;
++	return essential;
++}
++
+ static PIMAGE_IMPORT_DESCRIPTOR findImportImage(PIMAGE_IMPORT_DESCRIPTOR pImportDescriptor, size_t base, LPCSTR str) {
+ 	while (pImportDescriptor->Name)
+ 	{
+diff --git a/TermWrapTest/Source.cpp b/TermWrapTest/Source.cpp
+index 500b8ff..0b2138a 100644
+--- a/TermWrapTest/Source.cpp
++++ b/TermWrapTest/Source.cpp
+@@ -10,6 +10,7 @@
+ #endif
+ 
+ extern void patch(HMODULE hMod);
++extern bool buildPatchReport(char* buf, size_t size);
+ 
+ LONG NTAPI VexHandler(PEXCEPTION_POINTERS ExceptionInfo) {
+ 	PEXCEPTION_RECORD ExceptionRecord = ExceptionInfo->ExceptionRecord;
+@@ -108,5 +109,8 @@ int main(int argc, char** argv)
+ 	fflush(stderr);
+ 	int runs = printDiff(base, pNT, before, after, size);
+ 	printf("TOTAL %d patched location(s)\n", runs);
++	char report[512];
++	bool essential = buildPatchReport(report, sizeof(report));
++	printf("REPORT %s %s\n", essential ? "100" : "101", report);
+ 	return 0;
+ }
+-- 
+2.53.0.windows.2
+
