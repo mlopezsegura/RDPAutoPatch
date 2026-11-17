@@ -14,6 +14,10 @@ Zydis.dll            Desensamblador que usa TermWrap.dll.
 termwrap\            Codigo de TermWrap.dll: parches sobre llccd/TermWrap v0.7 (MIT) y build.ps1
                      para compilarla (necesita git y Visual Studio Build Tools 2022 con C++).
                      No hace falta copiarla a otros equipos.
+osms-extension.json  Extension de OpenStreamMS: se instala desde el panel (Extensiones) con el
+osms\                enlace de este repositorio o desde el catalogo oficial. Los scripts de osms\
+                     llaman a RDPAutoPatch.ps1 -Install / -Uninstall; si hay sesiones remotas
+                     conectadas, el cambio queda pendiente y se pide reiniciar Windows.
 
 Instalado en: C:\Program Files\RDPAutoPatch (la tarea usa esa copia, no esta carpeta).
 Registro:     C:\Program Files\RDPAutoPatch\autopatch.log

@@ -1,0 +1,16 @@
+{
+  "schema": 1,
+  "id": "rdpautopatch",
+  "name": "RDPAutoPatch (multi-RDP)",
+  "description": "Keeps the Remote Desktop service patched with TermWrap so Windows client editions accept several RDP sessions at once, and falls back to Windows' termsrv.dll if the patch stops working.",
+  "author": "mlopezsegura",
+  "homepage": "https://github.com/mlopezsegura/RDPAutoPatch",
+  "notice": "Patches the Windows Remote Desktop service (TermWrap, based on llccd/TermWrap 0.7, MIT). The Windows client license doesn't allow several remote sessions at once: the supported route is Windows Server with the RDS role and user CALs. Installing it is your own choice and responsibility. It installs to C:\\Program Files\\RDPAutoPatch, adds a scheduled task that re-checks the patch, and removes the classic RDP Wrapper if present. While sessions are connected the switch is postponed until they close or Windows restarts. Don't install it together with another multi-RDP extension.",
+  "component": {
+    "install": "osms/install.ps1",
+    "uninstall": "osms/uninstall.ps1",
+    "detect": "osms/detect.ps1",
+    "reboot": false,
+    "timeoutSec": 600
+  }
+}
