@@ -14,6 +14,9 @@ Zydis.dll            Desensamblador que usa TermWrap.dll.
 termwrap\            Codigo de TermWrap.dll: parches sobre llccd/TermWrap v0.7 (MIT) y build.ps1
                      para compilarla (necesita git y Visual Studio Build Tools 2022 con C++).
                      No hace falta copiarla a otros equipos.
+LICENSE              Licencia MIT de RDPAutoPatch.
+THIRD_PARTY_NOTICES.txt  Licencias MIT de TermWrap, Zydis y Zycore: acompanan a las DLL, copialo
+                     junto con ellas.
 osms-extension.json  Extension de OpenStreamMS: se instala desde el panel (Extensiones) con el
 osms\                enlace de este repositorio o desde el catalogo oficial. Los scripts de osms\
                      llaman a RDPAutoPatch.ps1 -Install / -Uninstall; si hay sesiones remotas
