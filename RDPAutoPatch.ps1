@@ -179,7 +179,36 @@ function Get-RdpPort {
     try { [int](Get-ItemProperty "$TsKey\WinStations\RDP-Tcp").PortNumber } catch { 3389 }
 }
 
-function Get-RemoteSessionCount { @(qwinsta 2>$null | Select-String 'rdp-tcp#').Count }
+# Sesiones conectadas por RDP (WinStation "RDP-Tcp#N"), con la API de WTS: qwinsta/query.exe no
+# existen en Windows Home, y alli el script fallaba al instalar ("qwinsta" no reconocido).
+function Get-RemoteSessionCount {
+    if (-not ('RdpAutoPatch.Wts' -as [type])) {
+        Add-Type -Namespace RdpAutoPatch -Name Wts -MemberDefinition @'
+[System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+public struct WTS_SESSION_INFO { public int SessionId; public System.IntPtr pWinStationName; public int State; }
+[System.Runtime.InteropServices.DllImport("wtsapi32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode, SetLastError = true)]
+public static extern bool WTSEnumerateSessionsW(System.IntPtr hServer, int Reserved, int Version, out System.IntPtr ppSessionInfo, out int pCount);
+[System.Runtime.InteropServices.DllImport("wtsapi32.dll")]
+public static extern void WTSFreeMemory(System.IntPtr pMemory);
+public static string[] WinStationNames() {
+    System.IntPtr buf; int count;
+    if (!WTSEnumerateSessionsW(System.IntPtr.Zero, 0, 1, out buf, out count))
+        throw new System.ComponentModel.Win32Exception();
+    try {
+        var names = new string[count];
+        int size = System.Runtime.InteropServices.Marshal.SizeOf(typeof(WTS_SESSION_INFO));
+        for (int i = 0; i < count; i++) {
+            var info = (WTS_SESSION_INFO)System.Runtime.InteropServices.Marshal.PtrToStructure(
+                new System.IntPtr(buf.ToInt64() + (long)i * size), typeof(WTS_SESSION_INFO));
+            names[i] = System.Runtime.InteropServices.Marshal.PtrToStringUni(info.pWinStationName);
+        }
+        return names;
+    } finally { WTSFreeMemory(buf); }
+}
+'@
+    }
+    @([RdpAutoPatch.Wts]::WinStationNames() | Where-Object { $_ -like 'RDP-Tcp#*' }).Count
+}
 
 # Varias sesiones del mismo usuario: fSingleSessionPerUser debe ser 0
 function Set-MultiSessionPerUser {
