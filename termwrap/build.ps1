@@ -42,14 +42,17 @@ Write-Host "Aplicados $($patches.Count) parche(s) sobre $($Commit.Substring(0, 8
 
 New-Item -ItemType Directory -Force $Out | Out-Null
 $common = '/nologo', '/v:m', '/p:Platform=x64'
-Invoke-Native 'Zydis' { & $msbuild "$Src\zydis\msvc\zydis\Zydis.vcxproj" @common '/p:Configuration=Release MD DLL' "/p:SolutionDir=$Src\zydis\msvc\\" }
+# MT: runtime de C estatico. Con MD, Zydis.dll dependia de VCRUNTIME140.dll, que un Windows recien
+# instalado no trae, y TermService no arrancaba ("No se puede encontrar el modulo especificado").
+Invoke-Native 'Zydis' { & $msbuild "$Src\zydis\msvc\zydis\Zydis.vcxproj" @common '/p:Configuration=Release MT DLL' "/p:SolutionDir=$Src\zydis\msvc\\" }
 foreach ($p in 'TermWrap', 'TermWrapTest') {
     Invoke-Native $p { & $msbuild "$Src\$p\$p.vcxproj" @common '/p:Configuration=Release' "/p:SolutionDir=$Src\\" "/p:OutDir=$Out\\" "/p:IntDir=$Src\obj\$p\\" }
 }
 Copy-Item "$Src\zydis\msvc\bin\ReleaseX64\Zydis.dll" $Out -Force
 
 # Prueba en seco con el termsrv.dll del equipo (se carga sin ejecutarlo y se parchea en memoria)
-$report = & "$Out\TermWrapTest.exe" 2>$null | Where-Object { $_ -match '^(TOTAL|REPORT)' }
+# Continue: en Windows PowerShell 5.1, con Stop, lo que el programa escribe en stderr corta el script
+$report = & { $ErrorActionPreference = 'Continue'; & "$Out\TermWrapTest.exe" 2>$null } | Where-Object { $_ -match '^(TOTAL|REPORT)' }
 $report | ForEach-Object { Write-Host $_ }
 if (-not ($report -match '^REPORT 100 ')) { throw 'El parche principal (DefPolicyPatch) no se aplica a este termsrv.dll' }
 
