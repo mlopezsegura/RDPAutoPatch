@@ -363,11 +363,10 @@ function Invoke-Check {
         if ($EnableRemoteDesktop) {
             Set-ItemProperty $TsKey -Name fDenyTSConnections -Value 0 -Type DWord
             Write-Log 'Escritorio remoto activado (fDenyTSConnections=0), como se ha pedido con -EnableRemoteDesktop' OK
-            # El servicio abre el puerto por su cuenta al ver el cambio; se le da un momento
-            $deadline = (Get-Date).AddSeconds(15)
-            while (-not (Get-NetTCPConnection -LocalPort (Get-RdpPort) -State Listen -ErrorAction SilentlyContinue) -and (Get-Date) -lt $deadline) {
-                Start-Sleep -Seconds 1
-            }
+            # El servicio no abre el puerto al ver el cambio (probado: 15 s sin escuchar); sin
+            # reiniciarlo, el modo en uso contaria como fallido. Con el Escritorio remoto
+            # desactivado no hay sesiones remotas que cortar.
+            try { Restart-TermService } catch { Write-Log "Error al reiniciar el servicio: $_" ERROR }
         } else {
             Write-Log 'El Escritorio remoto esta desactivado en Windows (fDenyTSConnections=1); no se toca y no se comprueba el puerto' WARN
             $script:RdpDisabled = $true
@@ -498,7 +497,13 @@ function Invoke-Install {
         $dllChanged = $false
         foreach ($f in $PinnedFiles) { if ((Get-Sha256 (Join-Path $src (Split-Path $f -Leaf))) -ne (Get-Sha256 $f)) { $dllChanged = $true } }
         if ($dllChanged) { Release-ServiceFrom $AppDir }
-        foreach ($f in $AppFiles) { Copy-Item (Join-Path $src $f) (Join-Path $AppDir $f) -Force }
+        # Solo lo que ha cambiado: TermWrap.dll y Zydis.dll estan cargadas en el servicio y no se
+        # pueden sobrescribir, asi que reinstalar la misma version fallaba ("esta en uso").
+        foreach ($f in $AppFiles) {
+            $from = Join-Path $src $f; $to = Join-Path $AppDir $f
+            if ((Test-Path $to) -and (Get-Sha256 $from) -eq (Get-Sha256 $to)) { continue }
+            Copy-Item $from $to -Force
+        }
         Write-Log "Programa copiado de $src a $AppDir"
     }
 
