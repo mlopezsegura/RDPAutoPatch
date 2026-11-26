@@ -32,6 +32,8 @@ Uso (PowerShell como administrador):
   .\RDPAutoPatch.ps1 -Install       Instala/actualiza, olvida fallos anteriores, crea la tarea y comprueba
   .\RDPAutoPatch.ps1 -Check         Comprueba y corrige (es lo que ejecuta la tarea programada)
   .\RDPAutoPatch.ps1 -Check -Force  Igual, aunque haya sesiones remotas abiertas (las corta)
+  -EnableRemoteDesktop              Con -Install o -Check: activa el Escritorio remoto si esta
+                                    desactivado (lo usa OpenStreamMS, que lo necesita)
   .\RDPAutoPatch.ps1                Muestra el estado sin cambiar nada
   .\RDPAutoPatch.ps1 -Uninstall     Quita la tarea, deja termsrv.dll original y borra la instalacion
 #>
@@ -40,7 +42,8 @@ param(
     [switch]$Install,
     [switch]$Check,
     [switch]$Uninstall,
-    [switch]$Force
+    [switch]$Force,
+    [switch]$EnableRemoteDesktop
 )
 
 $ErrorActionPreference = 'Stop'
@@ -57,6 +60,7 @@ $OldWrapDir = 'C:\Program Files\RDP Wrapper'
 $OldUninstallKeys = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\RDPWrap with Autoupdate 1.4',
                     'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\RDPWrap with Autoupdate 1.4'
 $script:ExitCode = 0
+$script:RdpDisabled = $false   # Escritorio remoto desactivado en Windows: el puerto no puede escuchar
 $MaxFailures = 3       # fallos de un modo antes de descartarlo para esa version de termsrv.dll
 $RetryHours  = 24      # espera antes de reintentar un modo que ha fallado
 $EventSource = 'RDPAutoPatch'
@@ -285,7 +289,12 @@ function Get-HealthProblems([string]$Mode, [datetime]$Since, [int]$SettleSeconds
     $port = Get-RdpPort
     $listen = Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue |
         Where-Object OwningProcess -eq $pid2
-    if (-not $listen) { $problems.Add("el servicio no escucha en el puerto $port") }
+    # Con el Escritorio remoto desactivado el servicio no abre el puerto en ningun modo: no dice
+    # nada del parche, y contarlo como fallo descartaba TermWrap y tambien el modo Original.
+    if (-not $listen) {
+        if ($script:RdpDisabled) { Write-Log "No se comprueba el puerto ${port}: el Escritorio remoto esta desactivado en Windows" }
+        else { $problems.Add("el servicio no escucha en el puerto $port") }
+    }
 
     $crashes = Get-TsCrashes $Since
     if ($crashes.Count) { $problems.Add("$($crashes.Count) cierre(s) inesperado(s) del servicio") }
@@ -351,7 +360,17 @@ function Invoke-Check {
     Set-MultiSessionPerUser
 
     if ((Get-ItemProperty $TsKey).fDenyTSConnections -ne 0) {
-        Write-Log 'El Escritorio remoto esta desactivado en Windows (fDenyTSConnections=1); no se toca' WARN
+        if ($EnableRemoteDesktop) {
+            Set-ItemProperty $TsKey -Name fDenyTSConnections -Value 0 -Type DWord
+            Write-Log 'Escritorio remoto activado (fDenyTSConnections=0), como se ha pedido con -EnableRemoteDesktop' OK
+            # El servicio no abre el puerto al ver el cambio (probado: 15 s sin escuchar); sin
+            # reiniciarlo, el modo en uso contaria como fallido. Con el Escritorio remoto
+            # desactivado no hay sesiones remotas que cortar.
+            try { Restart-TermService } catch { Write-Log "Error al reiniciar el servicio: $_" ERROR }
+        } else {
+            Write-Log 'El Escritorio remoto esta desactivado en Windows (fDenyTSConnections=1); no se toca y no se comprueba el puerto' WARN
+            $script:RdpDisabled = $true
+        }
     }
 
     $candidates = New-Object System.Collections.Generic.List[string]
@@ -478,7 +497,13 @@ function Invoke-Install {
         $dllChanged = $false
         foreach ($f in $PinnedFiles) { if ((Get-Sha256 (Join-Path $src (Split-Path $f -Leaf))) -ne (Get-Sha256 $f)) { $dllChanged = $true } }
         if ($dllChanged) { Release-ServiceFrom $AppDir }
-        foreach ($f in $AppFiles) { Copy-Item (Join-Path $src $f) (Join-Path $AppDir $f) -Force }
+        # Solo lo que ha cambiado: TermWrap.dll y Zydis.dll estan cargadas en el servicio y no se
+        # pueden sobrescribir, asi que reinstalar la misma version fallaba ("esta en uso").
+        foreach ($f in $AppFiles) {
+            $from = Join-Path $src $f; $to = Join-Path $AppDir $f
+            if ((Test-Path $to) -and (Get-Sha256 $from) -eq (Get-Sha256 $to)) { continue }
+            Copy-Item $from $to -Force
+        }
         Write-Log "Programa copiado de $src a $AppDir"
     }
 
